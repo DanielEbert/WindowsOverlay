@@ -4,6 +4,29 @@ from PyQt5.QtGui import QPixmap, QImage, QCursor, QPainter, QPen
 from PyQt5.QtCore import Qt, QTimer, QPoint, pyqtSignal, QObject
 import mss
 import mss.tools
+import pyinstrument
+from PIL import Image
+
+
+PROFILE = False
+
+
+capture_area = (1200, 1200, 2100, 1500)
+capture_area_x1, capture_area_y1, capture_area_x2, capture_area_y2 = capture_area
+
+def get_pixel(img, pos):
+    x = capture_area_x1 + pos[0]
+    y = capture_area_y1 + pos[1]
+
+    return img.pixel(x, y)
+
+def get_capture_pixel(pos):
+    return (
+        pos[0] - capture_area_x1,
+        pos[1] - capture_area_y1
+    )
+
+
 
 class OverlayWindow(QWidget):
     def __init__(self, capture_rect, display_position, sct, scaling: int = 1, show_mouse_position=False):
@@ -41,18 +64,17 @@ class OverlayWindow(QWidget):
             self.mouse_window = MousePositionWindow(sct)
             self.mouse_window.show()
 
-    def update_image(self):
-        # Capture the screen region using mss
-        monitor = {
-            "left": self.capture_rect[0],
-            "top": self.capture_rect[1],
-            "width": self.capture_rect[2] - self.capture_rect[0],
-            "height": self.capture_rect[3] - self.capture_rect[1]
-        }
-        sct_img = self.sct.grab(monitor)
-        # Convert the raw bytes to QImage
-        img = QImage(sct_img.rgb, sct_img.width, sct_img.height, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(img)
+    def update_image(self, raw_img):
+        x1 = self.capture_rect[0] - capture_area_x1
+        y1 = self.capture_rect[1] - capture_area_y1
+        x2 = x1 + (self.capture_rect[2] - self.capture_rect[0])
+        y2 = y1 + (self.capture_rect[3] - self.capture_rect[1])
+
+        img = raw_img.crop((x1, y1, x2, y2))
+
+        qt_image = QImage(img.tobytes(), img.width, img.height, QImage.Format_RGB888)
+
+        pixmap = QPixmap.fromImage(qt_image)
 
         scaled_pixmap = pixmap.scaled(
             round(pixmap.width() * self.scaling),
@@ -95,8 +117,11 @@ class BorderOverlay(QWidget):
 
         self.visible = False
     
-    def update_border(self):
-        pixel_rgb = self.sct.grab({'left': self.target_position[0], 'top': self.target_position[1], 'width': 1, 'height': 1}).pixel(0, 0)
+    def update_border(self, orig_img):
+        # pixel_rgb = self.sct.grab({'left': self.target_position[0], 'top': self.target_position[1], 'width': 1, 'height': 1}).pixel(0, 0)
+        x = self.target_position[0] - capture_area_x1
+        y = self.target_position[1] - capture_area_y1
+        pixel_rgb = orig_img.getpixel((x, y))
 
         prev_visible = self.visible
         self.visible = pixel_rgb == self.target_color_rgb if not self.invert_condition else pixel_rgb != self.target_color_rgb
@@ -146,12 +171,13 @@ class MousePositionWindow(QWidget):
         y = pos.y()
 
         # 1642, 1378
-        # pixel = self.sct.grab({'left': 1642, 'top': 1378, 'width': 1, 'height': 1}).pixel(0, 0)
+        # (1363, 1401)
+        # pixel = self.sct.grab({'left': 1388, 'top': 1388, 'width': 1, 'height': 1}).pixel(0, 0)
 
         #1582, 1300
         # full sword: (150, 124, 216)
 
-        # print(x, y, pixel)
+        # print(pixel)
 
         self.label.setText(f"Mouse Position:\nX: {x}, Y: {y}")
 
@@ -167,6 +193,10 @@ class Updater(QObject):
         super().__init__()
 
 def main():
+    if PROFILE:
+        profiler = pyinstrument.Profiler()
+        profiler.start()
+
     app = QApplication(sys.argv)
 
     capture_rects = [
@@ -189,7 +219,7 @@ def main():
 
     scalings = [1, 1, 1, 1.3, 1.3, 2]
 
-    show_mouse_position = True
+    show_mouse_position = False
 
     overlay_base_pos = (1480, 530, 1974, 1050)
 
@@ -198,7 +228,7 @@ def main():
     sword_border_overlay = BorderOverlay(
         (1582, 1297),
         (150, 124, 216),
-        (overlay_base_pos[0] - 10, overlay_base_pos[1] - 10, overlay_base_pos[2] + 10, overlay_base_pos[3] + 10),
+        overlay_base_pos,
         sct
     )
     sword_border_overlay.show()
@@ -206,12 +236,21 @@ def main():
     e_border_overlay = BorderOverlay(
         (1642, 1378),
         (0, 0, 0),
-        overlay_base_pos,
+        (overlay_base_pos[0] - 10, overlay_base_pos[1] - 10, overlay_base_pos[2] + 10, overlay_base_pos[3] + 10),
         sct,
-        Qt.blue,
+        Qt.green,
         invert_condition=True
     )
     e_border_overlay.show()
+
+    weapon_swap_border_overlay = BorderOverlay(
+        (1386, 1386),
+        (165, 146, 99),
+        (overlay_base_pos[0] - 20, overlay_base_pos[1] - 20, overlay_base_pos[2] + 20, overlay_base_pos[3] + 20),
+        sct,
+        Qt.yellow,
+    )
+    weapon_swap_border_overlay.show()
 
     windows = []
 
@@ -223,19 +262,38 @@ def main():
     updater = Updater()
 
     def update_all_windows():
+        sct_img = sct.grab({
+            'left': capture_area_x1,
+            'top': capture_area_y1,
+            'width': capture_area_x2 - capture_area_x1,
+            'height': capture_area_y2 - capture_area_y1
+        })
+
+        orig_img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+
         for window in windows:
-            window.update_image()
+            window.update_image(orig_img)
         
-        sword_border_overlay.update_border()
-        e_border_overlay.update_border()
+        sword_border_overlay.update_border(orig_img)
+        e_border_overlay.update_border(orig_img)
+        weapon_swap_border_overlay.update_border(orig_img)
 
     updater.update_signal.connect(update_all_windows)
 
     timer = QTimer()
     timer.timeout.connect(updater.update_signal.emit)
-    timer.start(30)  # 30 ms rate
+    timer.start(1000//60)  # 30 ms rate
 
-    sys.exit(app.exec_())
+    if PROFILE:
+        QTimer.singleShot(5_000, lambda: stop_profiler(profiler))
+
+    return app.exec_()
+
+
+def stop_profiler(profiler):
+    profiler.stop()
+    profiler.print(color=True)
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
